@@ -1,6 +1,6 @@
 # AdmKit
 
-A set of bash utilities covering three areas of Linux system administration: user/group lifecycle management, file integrity verification, and system diagnostics. I created this repo to eliminate the manual labor of chaining together multiple commands for tasks that come up constantly in sysadmin and support roles. Another reason for this repo is that there weren't any simple scripts online for these tasks.
+A set of bash utilities currently covering three areas of Linux system administration: user/group lifecycle management, file integrity verification, and system diagnostics. I created this repo to eliminate the manual labor of chaining together multiple commands for tasks that come up constantly in sysadmin and support roles. Another reason for this repo is that there weren't any simple scripts online for these tasks.
 
 ## Tools
 
