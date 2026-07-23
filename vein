@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# vein - A supply chain verification Tool
+# ==============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+# Exit Codes
+SUCCESS=0
+MISMATCH=1
+SIG_INVALID=2
+SIG_VALID_KEY_UNKNOWN=3
+KEY_EXPIRED_REVOKED=4
+WEAK_HASH_DETECTED=5
+NO_MANIFEST_ENTRY=6
+MISSING_DEPENDENCY=7
+NETWORK_TIMEOUT=8
+KEY_NOT_FOUND=9
+UNRECOGNIZED_INPUT=10
+VERIFY_TIMEOUT=11
+
+ALLOW_WEAK_HASHES=0
+CONFIG_FILE="$(dirname "$0")/known_fingerprints.conf"
+
+usage() {
+    echo -e "Usage: $0 [OPTIONS] <arg1> [arg2] [arg3]"
+    echo "Options:"
+    echo "  --allow-weak-hashes   Allow MD5 and SHA1 validation"
+    echo "  -h, --help            Show this help"
+    exit $UNRECOGNIZED_INPUT
+}
+
+POSITIONAL_ARGS=()
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --allow-weak-hashes) ALLOW_WEAK_HASHES=1; shift ;;
+        -h|--help) usage ;;
+        -*) echo -e "${RED}Unknown option: $1${NC}"; usage ;;
+        *) POSITIONAL_ARGS+=("$1"); shift ;;
+    esac
+done
+
+set -- "${POSITIONAL_ARGS[@]:-}"
+
+if [[ "$#" -lt 1 ]]; then usage; fi
+
+ARG1="$1"
+ARG2="${2:-}"
+ARG3="${3:-}"
+
+check_deps() {
+    local deps=("gpg" "awk" "sha256sum" "sha512sum" "md5sum" "sha1sum" "basename" "timeout" "mktemp" "dirname" "grep")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            echo -e "${RED}[ERROR] Missing dependency: $dep${NC}"
+            exit $MISSING_DEPENDENCY
+        fi
+    done
+}
+
+detect_input_type() {
+    # Branch E: The Golden Flow (.sig/.asc + Manifest + Target File)
+    if [[ "$ARG1" =~ \.(sig|asc)$ ]] && [[ -n "$ARG2" ]] && [[ -n "$ARG3" ]] && [[ -f "$ARG1" ]] && [[ -f "$ARG2" ]] && [[ -f "$ARG3" ]]; then
+        echo "BRANCH_E"; return
+    fi
+    # Branch A: GPG Detached Signature + Target File
+    if [[ "$ARG1" =~ \.(sig|asc)$ ]] && [[ -n "$ARG2" ]] && [[ -f "$ARG1" ]] && [[ -f "$ARG2" ]]; then
+        echo "BRANCH_A"; return
+    fi
+    # Branch C: Sidecar hash
+    if [[ "$ARG1" =~ \.(sha256|sha512|md5|sha1)$ ]] && [[ -f "$ARG1" ]] && [[ -z "$ARG2" ]]; then
+        echo "BRANCH_C"; return
+    fi
+    # Branch B: Manifest/Batch. Simple check: file exists and contains '<hash>  <file>' or '<hash> *<file>'
+    if [[ -f "$ARG1" ]] && grep -qE '^[a-fA-F0-9]{32,128}[ \t]+\*?[^ \t]+' "$ARG1" >/dev/null 2>&1; then
+        echo "BRANCH_B"; return
+    fi
+    # Branch D: Direct hash string + target file
+    if [[ "$ARG1" =~ ^[a-fA-F0-9]+$ ]] && [[ -f "$ARG2" ]]; then
+        local len=${#ARG1}
+        if [[ "$len" -eq 32 ]] || [[ "$len" -eq 40 ]] || [[ "$len" -eq 64 ]] || [[ "$len" -eq 128 ]]; then
+            echo "BRANCH_D"; return
+        fi
+    fi
+    echo "BRANCH_F"
+}
+
+weak_hash_check() {
+    local hash_len="$1"
+    if [[ "$hash_len" -eq 32 ]] || [[ "$hash_len" -eq 40 ]]; then
+        if [[ "$ALLOW_WEAK_HASHES" -eq 0 ]]; then
+            echo -e "${RED}[ERROR] WEAK HASH DETECTED (MD5/SHA1). Use --allow-weak-hashes to override.${NC}"
+            exit $WEAK_HASH_DETECTED
+        else
+            echo -e "${YELLOW}[WARNING] Proceeding with weak hash validation due to override flag.${NC}"
+        fi
+    fi
+}
+
+verify_checksum_direct() {
+    local expected_hash="$1"
+    local target_file="$2"
+    local hash_len=${#expected_hash}
+    weak_hash_check "$hash_len"
+
+    local cmd="sha256sum"
+    case "$hash_len" in
+        32) cmd="md5sum" ;;
+        40) cmd="sha1sum" ;;
+        64) cmd="sha256sum" ;;
+        128) cmd="sha512sum" ;;
+    esac
+
+    local actual_hash=$($cmd "$target_file" | awk '{print $1}')
+    if [[ "${actual_hash,,}" == "${expected_hash,,}" ]]; then
+        echo -e "${GREEN}[SUCCESS] Hash matched for $target_file${NC}"
+        exit $SUCCESS
+    else
+        echo -e "${RED}[ERROR] Hash mismatch for $target_file${NC}"
+        echo -e "Expected: $expected_hash\nActual:   $actual_hash"
+        exit $MISMATCH
+    fi
+}
+
+verify_checksum_sidecar() {
+    local sidecar="$1"
+    local target_file="${sidecar%.*}"
+
+    if [[ "$target_file" == "$sidecar" ]]; then
+        echo -e "${RED}[ERROR] Could not infer target filename from sidecar name '$sidecar' (no extension found).${NC}"
+        exit $UNRECOGNIZED_INPUT
+    fi
+
+    if [[ ! -f "$target_file" ]]; then
+        echo -e "${RED}[ERROR] Target file '$target_file' not found next to sidecar '$sidecar'${NC}"
+        exit $MISMATCH
+    fi
+    local expected_hash=$(awk '{print $1}' "$sidecar" | head -n 1)
+    verify_checksum_direct "$expected_hash" "$target_file"
+}
+
+fetch_and_verify_key() {
+    local key_id="$1"
+    echo -e "${YELLOW}[INFO] Missing public key $key_id. Attempting to fetch...${NC}"
+
+    local timeout_occurred=0
+
+    if timeout 10s gpg --batch --no-tty --keyserver hkps://keys.openpgp.org --recv-keys "$key_id" 2>/dev/null; then
+        echo -e "${GREEN}[INFO] Key $key_id fetched successfully.${NC}"
+        return 0
+    fi
+    [[ $? -eq 124 ]] && timeout_occurred=1
+
+    if timeout 10s gpg --batch --no-tty --keyserver hkps://keyserver.ubuntu.com --recv-keys "$key_id" 2>/dev/null; then
+        echo -e "${GREEN}[INFO] Key $key_id fetched successfully.${NC}"
+        return 0
+    fi
+    [[ $? -eq 124 ]] && timeout_occurred=1
+
+    if [[ $timeout_occurred -eq 1 ]]; then
+        echo -e "${RED}[ERROR] Network timeout while fetching key $key_id.${NC}"
+        exit $NETWORK_TIMEOUT
+    else
+        echo -e "${RED}[ERROR] Key $key_id not found on keyservers, or network is unreachable.${NC}"
+        exit $KEY_NOT_FOUND
+    fi
+}
+
+verify_gpg_signature() {
+    local sigfile="$1"
+    local targetfile="$2"
+    local retry_count=0
+
+    export GNUPGHOME="$(mktemp -d)"
+    trap 'rm -rf "$GNUPGHOME"' EXIT
+
+    while [[ $retry_count -le 1 ]]; do
+        local status_output=""
+        local verify_exit=0
+
+        status_output=$(timeout 10s gpg --batch --no-tty --status-fd 1 --verify "$sigfile" "$targetfile" 2>/dev/null) || verify_exit=$?
+
+        if [[ $verify_exit -eq 124 ]]; then
+            echo -e "${RED}[ERROR] GPG verification timed out (possible slow trustdb init on ephemeral keyring).${NC}"
+            exit $VERIFY_TIMEOUT
+        fi
+
+        if echo "$status_output" | grep -q "^\[GNUPG:\] NO_PUBKEY"; then
+            if [[ $retry_count -eq 1 ]]; then
+                echo -e "${RED}[ERROR] Key fetched, but verification still failed. Key ID may not match the actual signer.${NC}"
+                exit $SIG_INVALID
+            fi
+            local missing_key=$(echo "$status_output" | grep "^\[GNUPG:\] NO_PUBKEY" | awk '{print $3}')
+            fetch_and_verify_key "$missing_key"
+            retry_count=$((retry_count + 1))
+            continue
+        fi
+
+        if echo "$status_output" | grep -qE "^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG)"; then
+            echo -e "${RED}[ERROR] Signature key has expired or been revoked.${NC}"
+            exit $KEY_EXPIRED_REVOKED
+        fi
+
+        if echo "$status_output" | grep -q "^\[GNUPG:\] BADSIG"; then
+            echo -e "${RED}[ERROR] Cryptographically invalid signature (tampered/corrupted).${NC}"
+            exit $SIG_INVALID
+        fi
+
+        if echo "$status_output" | grep -qE "^\[GNUPG:\] (GOODSIG|VALIDSIG)"; then
+            local fingerprint
+            fingerprint=$(echo "$status_output" | grep "^\[GNUPG:\] VALIDSIG" | awk '{print $3}' | head -n 1)
+
+            if [[ ! "$fingerprint" =~ ^[A-F0-9]{40}$ ]]; then
+                echo -e "${RED}[ERROR] Could not reliably extract signer fingerprint from GPG output.${NC}"
+                exit $SIG_INVALID
+            fi
+
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+                echo -e "${YELLOW}[WARNING] Signature Valid, but $CONFIG_FILE is missing. Cannot verify trust.${NC}"
+                exit $SIG_VALID_KEY_UNKNOWN
+            fi
+
+            local vendor_match
+            vendor_match=$(awk -F', *' -v fp="$fingerprint" '$3==fp{print $1; exit}' "$CONFIG_FILE")
+
+            if [[ -n "$vendor_match" ]]; then
+                echo -e "${GREEN}[SUCCESS] Signature Valid AND Key Trusted (Vendor: $vendor_match)${NC}"
+                return 0
+            else
+                echo -e "${YELLOW}[WARNING] Signature Valid, but Key Fingerprint ($fingerprint) is UNKNOWN.${NC}"
+                echo -e "Verify manually against a trusted source."
+                exit $SIG_VALID_KEY_UNKNOWN
+            fi
+        fi
+
+        echo -e "${RED}[ERROR] Unhandled GPG status.${NC}"
+        exit $SIG_INVALID
+    done
+}
+
+batch_verify_lookup() {
+    local manifest="$1"
+    local target_file="$2"
+    local target_base
+    target_base=$(basename -- "$target_file")
+
+    local expected_line
+    expected_line=$(awk -v tf="$target_base" '{gsub(/^\*/, "", $2); if ($2 == tf) print $0}' "$manifest")
+
+    if [[ -z "$expected_line" ]]; then
+        echo -e "${RED}[ERROR] File '$target_base' not found in manifest '$manifest'.${NC}"
+        exit $NO_MANIFEST_ENTRY
+    fi
+
+    local expected_hash=$(echo "$expected_line" | awk '{print $1}')
+    verify_checksum_direct "$expected_hash" "$target_file"
+}
+
+batch_verify_all() {
+    local manifest="$1"
+    local dir="${2:-.}"
+    echo -e "Batch verification of '$dir' against manifest '$manifest':\n"
+    printf "%-30s | %-15s | %-10s\n" "Filename" "Hash length" "Status"
+    printf "%-30s | %-15s | %-10s\n" "------------------------------" "---------------" "----------"
+
+    local all_success=1
+
+    while read -r expected_hash filename; do
+        [[ -z "$expected_hash" ]] && continue
+
+        filename="${filename#\*}"
+
+        local target_path="$dir/$filename"
+        if [[ ! -f "$target_path" ]]; then
+             printf "%-30s | %-15s | \033[0;31m%-10s\033[0m\n" "$filename" "${#expected_hash}" "MISSING"
+             all_success=0
+             continue
+        fi
+
+        local cmd="sha256sum"
+        case "${#expected_hash}" in
+            32) cmd="md5sum" ;;
+            40) cmd="sha1sum" ;;
+            64) cmd="sha256sum" ;;
+            128) cmd="sha512sum" ;;
+        esac
+
+        local actual_hash=$($cmd "$target_path" | awk '{print $1}')
+        if [[ "${actual_hash,,}" == "${expected_hash,,}" ]]; then
+            printf "%-30s | %-15s | \033[0;32m%-10s\033[0m\n" "$filename" "${#expected_hash}" "OK"
+        else
+            printf "%-30s | %-15s | \033[0;31m%-10s\033[0m\n" "$filename" "${#expected_hash}" "FAIL"
+            all_success=0
+        fi
+    done < "$manifest"
+
+    if [[ $all_success -eq 1 ]]; then exit $SUCCESS; else exit $MISMATCH; fi
+}
+
+check_deps
+BRANCH=$(detect_input_type)
+
+case "$BRANCH" in
+    BRANCH_A)
+        verify_gpg_signature "$ARG1" "$ARG2"
+        exit $SUCCESS
+        ;;
+    BRANCH_B)
+        if [[ -n "$ARG2" ]] && [[ -d "$ARG2" ]]; then
+            batch_verify_all "$ARG1" "$ARG2"
+        elif [[ -n "$ARG2" ]] && [[ -f "$ARG2" ]]; then
+            batch_verify_lookup "$ARG1" "$ARG2"
+        else
+            batch_verify_all "$ARG1" "."
+        fi
+        ;;
+    BRANCH_C)
+        verify_checksum_sidecar "$ARG1"
+        ;;
+    BRANCH_D)
+        verify_checksum_direct "$ARG1" "$ARG2"
+        ;;
+    BRANCH_E)
+        echo -e "${YELLOW}[INFO] Golden Flow: Verifying Manifest Signature...${NC}"
+        verify_gpg_signature "$ARG1" "$ARG2"
+        echo -e "${YELLOW}[INFO] Golden Flow: Signature trusted. Verifying ISO Hash...${NC}"
+        batch_verify_lookup "$ARG2" "$ARG3"
+        ;;
+    BRANCH_F)
+        echo -e "${RED}[ERROR] Unrecognized input.${NC}"
+        usage
+        ;;
+esac

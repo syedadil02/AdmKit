@@ -1,0 +1,901 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# UGM - User/Group Manager
+# A tool for managing Linux users and groups.
+# ==============================================================================
+
+set -euo pipefail
+
+# ==============================================================================
+# VARIABLES & PATHS
+# ==============================================================================
+UGM_DIR="/var/lib/ugm"
+PASS_DIR="${UGM_DIR}/passwords"
+LEDGER="${UGM_DIR}/deleted_ids.db"
+AUDIT_LOG="/var/log/ugm_audit.log"
+CRON_FILE="/etc/cron.d/ugm-cleanup"
+SYSTEMD_TIMER="/etc/systemd/system/ugm-cleanup.timer"
+SYSTEMD_SVC="/etc/systemd/system/ugm-cleanup.service"
+BACKUP_DIR="/var/backups/ugm_archives"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ==============================================================================
+# PRE-FLIGHT
+# ==============================================================================
+show_help() {
+    cat << EOF
+UGM (User/Group Manager) v1.9
+Usage: ugm.sh [OPTIONS]
+
+Data & Logs Locations:
+  Ledger DB:    ${LEDGER}
+  Passwords:    ${PASS_DIR}
+  Audit Log:    ${AUDIT_LOG}
+  Backups:      ${BACKUP_DIR}
+
+User Options:
+  -c,  --create <user>         Create a user interactively.
+  -d,  --delete <user>         Safe delete a user.
+  -k,  --kick <user>           PANIC BUTTON: Kill all sessions and lock account.
+  -R,  --resources <user>      Show instantaneous resource snapshot for user.
+  -lu, --list-users            List system users (UID >= 1000).
+
+Group Options:
+  -gc, --group-create <grp>    Create a new group.
+  -gd, --group-delete <grp>    Delete a group.
+  -m,  --migrate-to <grp>      Required target group if deleting a primary group.
+  -lg, --list-groups           List system groups (GID >= 1000).
+
+Bulk Options:
+  -b,  --bulk <file.csv>       Bulk import users.
+  -n,  --dry-run               Validate CSV without modifying the system.
+  -a,  --allow-system-ids      Override UID/GID validation bounds (UID_MIN/GID_MIN).
+
+Maintenance:
+  -s,  --shred-passwords       Delete all bulk-generated password temp files (rm -f).
+  -i,  --install-completion    Install bash tab-completion for ugm.sh.
+  -h,  --help                  Show this menu.
+EOF
+}
+
+for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        show_help
+        exit 0
+    fi
+done
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Error: This script must be run as root.${NC}" >&2
+        exit 1
+    fi
+}
+check_root
+
+prompt_confirm() {
+    local msg="$1"
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}${msg} [y/N]: ${NC}")" yn < /dev/tty
+        case ${yn:-N} in
+            [Yy]* ) return 0;;
+            [Nn]* ) return 1;;
+            * ) echo "Please answer yes or no.";;
+        esac
+    done
+}
+
+# ==============================================================================
+# INITIALIZATION & UTILS
+# ==============================================================================
+init_system() {
+    mkdir -p "${PASS_DIR}" "${BACKUP_DIR}"
+    chmod 700 "${UGM_DIR}" "${PASS_DIR}" "${BACKUP_DIR}"
+
+    if [[ ! -f "${LEDGER}" ]]; then
+        touch "${LEDGER}"
+        chmod 600 "${LEDGER}"
+    fi
+    if [[ ! -f "${AUDIT_LOG}" ]]; then
+        touch "${AUDIT_LOG}"
+        chmod 600 "${AUDIT_LOG}"
+    fi
+
+    # Cleanup scheduling configuration
+    if [[ ! -f "${CRON_FILE}" && ! -f "${SYSTEMD_TIMER}" ]]; then
+        if ! command -v crontab >/dev/null 2>&1 && ! command -v cron >/dev/null 2>&1 && ! command -v crond >/dev/null 2>&1; then
+            echo -e "${YELLOW}Notice: 'cron' does not appear to be installed on this system.${NC}"
+            if prompt_confirm "Do you want to create a systemd timer for temporary password cleanup instead?"; then
+                cat << 'EOF' > "${SYSTEMD_SVC}"
+[Unit]
+Description=UGM Password Cleanup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /var/lib/ugm/passwords -type f -name '*_temp_pass.txt' -mmin +1440 -exec rm -f {} \;
+EOF
+                cat << 'EOF' > "${SYSTEMD_TIMER}"
+[Unit]
+Description=Run UGM Password Cleanup every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+                systemctl daemon-reload
+                systemctl enable --now ugm-cleanup.timer >/dev/null 2>&1 || true
+                echo -e "${GREEN}systemd timer enabled for ugm-cleanup.${NC}"
+            elif prompt_confirm "Would you like to try installing cron? (apt/dnf/pacman)"; then
+                if command -v apt >/dev/null; then apt update && apt install -y cron
+                elif command -v dnf >/dev/null; then dnf install -y cronie
+                elif command -v pacman >/dev/null; then pacman -S --noconfirm cronie
+                fi
+                if command -v crontab >/dev/null; then
+                    mkdir -p /etc/cron.d
+                    echo "*/15 * * * * root find ${PASS_DIR} -type f -name '*_temp_pass.txt' -mmin +1440 -exec rm -f {} \;" > "${CRON_FILE}"
+                    chmod 644 "${CRON_FILE}"
+                    echo -e "${GREEN}cron installed and configured.${NC}"
+                fi
+            fi
+        else
+            if [[ -d "/etc/cron.d" ]]; then
+                echo "*/15 * * * * root find ${PASS_DIR} -type f -name '*_temp_pass.txt' -mmin +1440 -exec rm -f {} \;" > "${CRON_FILE}"
+                chmod 644 "${CRON_FILE}"
+            fi
+        fi
+    fi
+}
+init_system
+
+log_action() {
+    local msg="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ${msg}" >> "${AUDIT_LOG}"
+}
+
+# ==============================================================================
+# LEDGER & ID CHECKS
+# ==============================================================================
+check_uid_collision() {
+    local target_uid="$1"
+    if [[ ! "$target_uid" =~ ^[0-9]{1,10}$ ]]; then echo "INVALID"; return; fi
+    if getent passwd "${target_uid}" > /dev/null 2>&1; then echo "ACTIVE"; return; fi
+    if grep -q "^USER:${target_uid}:" "${LEDGER}" 2>/dev/null; then echo "HISTORICAL"; return; fi
+    echo "CLEAN"
+}
+
+check_gid_collision() {
+    local target_gid="$1"
+    if [[ ! "$target_gid" =~ ^[0-9]{1,10}$ ]]; then echo "INVALID"; return; fi
+    if getent group "${target_gid}" > /dev/null 2>&1; then echo "ACTIVE"; return; fi
+    if grep -q "^GROUP:${target_gid}:" "${LEDGER}" 2>/dev/null; then echo "HISTORICAL"; return; fi
+    echo "CLEAN"
+}
+
+# ==============================================================================
+# LIST FUNCTIONS
+# ==============================================================================
+cmd_list_users() {
+    echo -e "\n${CYAN}=== System Users (UID >= 1000) ===${NC}"
+    awk -F: '$3 >= 1000 && $3 != 65534 {printf " %-15s UID: %-6s Home: %s\n", $1, $3, $6}' /etc/passwd | column -t
+    echo ""
+}
+
+cmd_list_groups() {
+    echo -e "\n${CYAN}=== System Groups (GID >= 1000) ===${NC}"
+    awk -F: '$3 >= 1000 && $3 != 65534 {printf " %-15s GID: %-6s Members: %s\n", $1, $3, $4}' /etc/group | column -t
+    echo ""
+}
+
+# ==============================================================================
+# USER FUNCTIONS
+# ==============================================================================
+generate_secure_password() {
+    local username="$1"
+    local interactive="${2:-false}"
+    local raw_pass
+    raw_pass=$(openssl rand -base64 12)
+
+    if [[ "$interactive" == "true" ]]; then
+        echo "${username}:${raw_pass}" | chpasswd
+        chage -d 0 "${username}"
+        echo -e "${GREEN}Password for ${username} successfully generated:${NC}"
+        echo -e "${CYAN}${raw_pass}${NC}"
+        echo -e "${YELLOW}User MUST change this password upon first login.${NC}"
+        echo -e "Press [Enter] after you have securely copied this password..."
+        read -r < /dev/tty
+        clear
+    else
+        local pass_file="${PASS_DIR}/${username}_$(date +%s)_temp_pass.txt"
+        touch "${pass_file}"
+        chmod 600 "${pass_file}"
+        echo "${raw_pass}" > "${pass_file}"
+        echo "${username}:${raw_pass}" | chpasswd
+        chage -d 0 "${username}"
+        echo "${pass_file}"
+    fi
+}
+
+cmd_create_user() {
+    local username="${1:-}"
+    if [[ -z "$username" ]]; then read -r -p "Enter new username: " username < /dev/tty; fi
+
+    if getent passwd "${username}" > /dev/null; then
+        echo -e "${RED}Error: User ${username} already exists.${NC}" >&2
+        return 1
+    fi
+
+    local target_uid=""
+    read -r -p "Enter specific UID (leave blank for auto-assignment): " custom_uid < /dev/tty
+    if [[ -n "$custom_uid" ]]; then
+        if [[ ! "$custom_uid" =~ ^[0-9]{1,10}$ ]]; then
+            echo -e "${RED}Error: Invalid UID format.${NC}" >&2
+            return 1
+        fi
+        local stat
+        stat=$(check_uid_collision "$custom_uid")
+        if [[ "$stat" != "CLEAN" ]]; then
+            echo -e "${RED}Error: UID ${custom_uid} is ${stat}.${NC}" >&2
+            return 1
+        fi
+        target_uid="$custom_uid"
+    else
+        target_uid=$(awk '/^UID_MIN/ {print $2}' /etc/login.defs 2>/dev/null || echo 1000)
+        if [[ -z "$target_uid" || ! "$target_uid" =~ ^[0-9]{1,10}$ ]]; then target_uid=1000; fi
+        while [[ "$(check_uid_collision "$target_uid")" != "CLEAN" ]]; do
+            target_uid=$((target_uid + 1))
+        done
+    fi
+
+    useradd -u "$target_uid" -m -s /bin/bash "${username}" || {
+        echo -e "${RED}Error: Failed to create user ${username}.${NC}" >&2
+        return 1
+    }
+
+    log_action "CREATED USER: ${username} (UID: ${target_uid})"
+    generate_secure_password "${username}" "true"
+}
+
+cmd_delete_user() {
+    local username="${1:-}"
+    if [[ -z "$username" ]]; then read -r -p "Enter username to delete: " username < /dev/tty; fi
+
+    if ! getent passwd "${username}" > /dev/null; then
+        echo -e "${RED}Error: User ${username} does not exist.${NC}" >&2
+        return 1
+    fi
+
+    local uid
+    uid=$(id -u "${username}")
+    local homedir
+    homedir=$(getent passwd "${username}" | cut -d: -f6 || echo "")
+
+    echo -e "${CYAN}=== User Deletion Plan: ${username} ===${NC}"
+    echo "The following actions will be taken:"
+    echo " 1. Active sessions will be forcefully terminated (SIGTERM -> SIGKILL)."
+    echo " 2. Crontab entries for the user will be removed."
+    echo " 3. The account and home directory (${homedir}) will be deleted."
+
+    local do_backup=0
+    if [[ -n "${homedir}" && -d "${homedir}" && "${homedir}" != "/" ]]; then
+        if prompt_confirm "Do you want to backup the user's home directory before deletion?"; then
+            do_backup=1
+        fi
+    fi
+
+    if ! prompt_confirm "Are you absolutely sure you want to proceed with offboarding ${username}?"; then
+        echo "Aborted."
+        return 1
+    fi
+
+    echo -e "${YELLOW}Killing active sessions...${NC}"
+    pkill -TERM -u "${username}" || true
+    sleep 2
+    pkill -KILL -u "${username}" || true
+
+    echo -e "${YELLOW}Removing crontabs...${NC}"
+    crontab -r -u "${username}" 2>/dev/null || true
+
+    local backup_file="${BACKUP_DIR}/${username}_$(date +%Y%m%d).tar.gz"
+    if [[ $do_backup -eq 1 ]]; then
+        echo -e "${YELLOW}Archiving home directory to ${backup_file}...${NC}"
+        tar -czf "${backup_file}" -C "$(dirname "${homedir}")" "$(basename "${homedir}")" || {
+            echo -e "${RED}Error: Backup failed. Aborting deletion for safety.${NC}" >&2
+            return 1
+        }
+    fi
+
+    echo -e "${YELLOW}Deleting user account...${NC}"
+    userdel -r "${username}" || {
+        echo -e "${RED}Error: Failed to cleanly delete user ${username}.${NC}" >&2
+        return 1
+    }
+
+    echo "USER:${uid}:${username}:$(date '+%Y-%m-%d')" >> "${LEDGER}"
+    log_action "DELETED USER: ${username} (UID ${uid})."
+    echo -e "${GREEN}User ${username} successfully deleted and recorded in ledger.${NC}"
+}
+
+cmd_panic_kick() {
+    local username="${1:-}"
+    if [[ -z "$username" ]]; then read -r -p "Enter username to kick: " username < /dev/tty; fi
+    echo -e "${RED}Executing Panic Logout for ${username}...${NC}"
+    passwd -l "${username}" >/dev/null 2>&1 || true
+    pkill -KILL -u "${username}" || true
+    log_action "PANIC KICK: ${username}"
+    echo -e "${GREEN}All sessions terminated. Account locked.${NC}"
+}
+
+cmd_resources() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then read -r -p "Enter username to snapshot resources for: " target < /dev/tty; fi
+    echo -e "\n${CYAN}=== [Instantaneous Resource Snapshot] ===${NC}"
+    echo -e "User: ${target}"
+    echo "-----------------------------------------"
+    ps -U "${target}" -u "${target}" u || echo "No active processes."
+    local homedir
+    homedir=$(getent passwd "${target}" | cut -d: -f6 || echo "")
+    echo -e "\nHome Directory Disk Usage:"
+    if [[ -n "${homedir}" && -d "${homedir}" ]]; then
+        du -sh "${homedir}"
+    else
+        echo "No valid home directory found."
+    fi
+    echo -e "=========================================\n"
+}
+
+# ==============================================================================
+# GROUP FUNCTIONS
+# ==============================================================================
+cmd_group_create() {
+    local groupname="${1:-}"
+    if [[ -z "$groupname" ]]; then read -r -p "Enter new group name: " groupname < /dev/tty; fi
+
+    if getent group "${groupname}" > /dev/null; then
+        echo -e "${RED}Error: Group ${groupname} already exists.${NC}" >&2
+        return 1
+    fi
+
+    local target_gid=""
+    read -r -p "Enter specific GID (leave blank for auto-assignment): " custom_gid < /dev/tty
+    if [[ -n "$custom_gid" ]]; then
+        if [[ ! "$custom_gid" =~ ^[0-9]{1,10}$ ]]; then
+            echo -e "${RED}Error: Invalid GID format.${NC}" >&2
+            return 1
+        fi
+        local stat
+        stat=$(check_gid_collision "$custom_gid")
+        if [[ "$stat" != "CLEAN" ]]; then
+            echo -e "${RED}Error: GID ${custom_gid} is ${stat}.${NC}" >&2
+            return 1
+        fi
+        target_gid="$custom_gid"
+    else
+        target_gid=$(awk '/^GID_MIN/ {print $2}' /etc/login.defs 2>/dev/null || echo 1000)
+        if [[ -z "$target_gid" || ! "$target_gid" =~ ^[0-9]{1,10}$ ]]; then target_gid=1000; fi
+        while [[ "$(check_gid_collision "$target_gid")" != "CLEAN" ]]; do
+            target_gid=$((target_gid + 1))
+        done
+    fi
+
+    groupadd -g "$target_gid" "${groupname}" || {
+        echo -e "${RED}Error: Failed to create group ${groupname}.${NC}" >&2
+        return 1
+    }
+
+    log_action "CREATED GROUP: ${groupname} (GID: ${target_gid})"
+    echo -e "${GREEN}Group ${groupname} created (GID: ${target_gid}).${NC}"
+
+    if prompt_confirm "Would you like to add existing users to this new group?"; then
+        cmd_list_users
+        read -r -p "Enter comma-separated usernames to add: " users_to_add < /dev/tty
+        IFS=',' read -ra ADDR <<< "$users_to_add"
+        for u in "${ADDR[@]}"; do
+            u=$(echo "$u" | xargs) # trim whitespace
+            if [[ -z "$u" ]]; then continue; fi
+            if getent passwd "$u" >/dev/null; then
+                usermod -aG "${groupname}" "$u"
+                echo -e "${GREEN}Added ${u} to ${groupname}.${NC}"
+            else
+                echo -e "${RED}User ${u} does not exist. Skipped.${NC}"
+            fi
+        done
+    fi
+}
+
+cmd_group_delete() {
+    local groupname="${1:-}"
+    local migrate_to="${2:-}"
+
+    if [[ -z "$groupname" ]]; then read -r -p "Enter group name to delete: " groupname < /dev/tty; fi
+
+    if ! getent group "${groupname}" > /dev/null; then
+        echo -e "${RED}Error: Group ${groupname} does not exist.${NC}" >&2
+        return 1
+    fi
+
+    local gid
+    gid=$(getent group "${groupname}" | cut -d: -f3)
+
+    local primary_members
+    primary_members=$(awk -F: -v gid="$gid" '$4 == gid {print $1}' /etc/passwd)
+    local supp_members
+    supp_members=$(getent group "${groupname}" | cut -d: -f4)
+
+    echo -e "${CYAN}=== Group Deletion Plan: ${groupname} ===${NC}"
+    if [[ -n "$primary_members" ]]; then
+        echo -e "${YELLOW}Primary members to migrate:${NC} $(echo "$primary_members" | tr '\n' ' ')"
+        if [[ -z "$migrate_to" ]]; then
+            read -r -p "Enter target group to migrate these users to: " migrate_to < /dev/tty
+        fi
+        if [[ "$migrate_to" == "$groupname" ]]; then
+            echo -e "${RED}Error: Target migration group cannot be the group being deleted. Aborting.${NC}" >&2
+            return 1
+        fi
+        if ! getent group "${migrate_to}" > /dev/null; then
+            echo -e "${RED}Error: Target migration group '${migrate_to}' does not exist. Aborting.${NC}" >&2
+            return 1
+        fi
+    else
+        echo -e "${GREEN}No primary members. No migration required.${NC}"
+    fi
+
+    if [[ -n "$supp_members" ]]; then
+        echo -e "${YELLOW}Supplementary members to remove:${NC} $supp_members"
+    fi
+
+    if ! prompt_confirm "Are you sure you want to proceed with deleting group '${groupname}'?"; then
+        echo "Aborted."
+        return 1
+    fi
+
+    if [[ -n "$primary_members" ]]; then
+        for u in $primary_members; do
+            usermod -g "${migrate_to}" "$u"
+            log_action "MIGRATED: User $u primary group changed to ${migrate_to}"
+        done
+    fi
+
+    groupdel "${groupname}" || {
+        echo -e "${RED}Error: Failed to delete group ${groupname}.${NC}" >&2
+        return 1
+    }
+
+    echo "GROUP:${gid}:${groupname}:$(date '+%Y-%m-%d')" >> "${LEDGER}"
+    log_action "DELETED GROUP: ${groupname} (GID ${gid})"
+    echo -e "${GREEN}Group ${groupname} safely deleted and recorded in ledger.${NC}"
+}
+
+# ==============================================================================
+# BULK IMPORT
+# ==============================================================================
+cmd_bulk_import() {
+    local csv_file="${1:-}"
+    local is_dry_run="${2:-false}"
+    local allow_sys="${3:-false}"
+
+    if [[ ! -f "$csv_file" ]]; then
+        echo -e "${RED}Error: CSV file not found: $csv_file${NC}" >&2
+        return 1
+    fi
+
+    local run_id
+    run_id=$(date +%s)
+    local fail_log="/var/tmp/ugm_import_${run_id}.log"
+    echo "=== Bulk Import Run $(date) ===" > "$fail_log"
+
+    local uid_min
+    uid_min=$(awk '/^UID_MIN/ {print $2}' /etc/login.defs 2>/dev/null || echo 1000)
+    if [[ ! "$uid_min" =~ ^[0-9]{1,10}$ ]]; then uid_min=1000; fi
+    local gid_min
+    gid_min=$(awk '/^GID_MIN/ {print $2}' /etc/login.defs 2>/dev/null || echo 1000)
+    if [[ ! "$gid_min" =~ ^[0-9]{1,10}$ ]]; then gid_min=1000; fi
+
+    local priv_gids="0"
+    for pg in wheel sudo docker admin root; do
+        local pgid
+        pgid=$(getent group "$pg" | cut -d: -f3 2>/dev/null || true)
+        if [[ -n "$pgid" ]]; then
+            priv_gids="$priv_gids $pgid"
+        fi
+    done
+
+    echo -e "${CYAN}Starting CSV Validation...${NC}"
+    local line_num=0
+    local errors=0
+    local valid_rows=0
+    local seen_users=""
+    local seen_uids=""
+    local seen_new_gids=""
+
+    while IFS=',' read -r user pass uid gid groups shell; do
+        line_num=$((line_num + 1))
+
+        if [[ -z "$user" || "$user" == "user" || "$user" == "username" ]]; then continue; fi
+
+        # Sanitize Excel DOS line endings (\r) from the last column
+        shell="${shell//$'\r'/}"
+
+        if [[ -z "$shell" ]]; then
+            echo "Line ${line_num}: Malformed row (missing columns)." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        if ! grep -qxF -- "${shell}" /etc/shells; then
+            echo "Line ${line_num}: Invalid shell '${shell}' for user ${user}." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        # Base-10 numerical normalization
+        # Restrict to 10 digits to prevent bash 64-bit arithmetic overflow crashes
+        if [[ "$uid" =~ ^[0-9]{1,10}$ ]]; then uid=$((10#$uid)); fi
+        if [[ "$gid" =~ ^[0-9]{1,10}$ ]]; then gid=$((10#$gid)); fi
+
+        # --- PRIVILEGE FLOOR CHECKS ---
+        if [[ "$uid" == "0" ]]; then
+            echo "Line ${line_num}: UID 0 is a protected system ID and cannot be assigned via bulk import." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        local is_priv_gid=0
+        for pg in $priv_gids; do
+            if [[ "$gid" == "$pg" ]]; then
+                is_priv_gid=1
+                break
+            fi
+        done
+        if [[ $is_priv_gid -eq 1 ]]; then
+            echo "Line ${line_num}: GID ${gid} is a protected system group and cannot be assigned via bulk import." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+        # -------------------------------
+
+        if [[ "$allow_sys" == "false" ]]; then
+            if [[ "$uid" =~ ^[0-9]{1,10}$ ]] && (( uid < uid_min )); then
+                echo "Line ${line_num}: UID ${uid} is below system minimum (${uid_min}). Use --allow-system-ids to override." | tee -a "$fail_log"
+                errors=$((errors + 1))
+                continue
+            fi
+            if [[ "$gid" =~ ^[0-9]{1,10}$ ]] && (( gid < gid_min )); then
+                echo "Line ${line_num}: GID ${gid} is below system minimum (${gid_min}). Use --allow-system-ids to override." | tee -a "$fail_log"
+                errors=$((errors + 1))
+                continue
+            fi
+        fi
+
+        if echo "$seen_users" | grep -qxF "$user" >/dev/null 2>&1; then
+            echo "Line ${line_num}: Internal duplicate username '${user}' in CSV." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+        seen_users="$seen_users"$'\n'"$user"
+
+        if echo "$seen_uids" | grep -qxF "$uid" >/dev/null 2>&1; then
+            echo "Line ${line_num}: Internal duplicate UID '${uid}' in CSV." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+        seen_uids="$seen_uids"$'\n'"$uid"
+
+        if getent passwd "${user}" > /dev/null; then
+            echo "Line ${line_num}: Username ${user} already exists on system." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        local uid_stat
+        uid_stat=$(check_uid_collision "$uid")
+        if [[ "$uid_stat" != "CLEAN" ]]; then
+            echo "Line ${line_num}: UID ${uid} collision/error (${uid_stat}) for user ${user}." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        local gid_stat
+        gid_stat=$(check_gid_collision "$gid")
+        if [[ "$gid_stat" == "HISTORICAL" || "$gid_stat" == "INVALID" ]]; then
+            echo "Line ${line_num}: GID ${gid} collision/error (${gid_stat}) for user ${user}." | tee -a "$fail_log"
+            errors=$((errors + 1))
+            continue
+        elif [[ "$gid_stat" == "CLEAN" ]]; then
+            if echo "$seen_new_gids" | grep -qxF "$gid" >/dev/null 2>&1; then
+                echo "Line ${line_num}: Advisory - GID ${gid} is a shared new group. User ${user} will join the first row's auto-generated group." | tee -a "$fail_log"
+            fi
+            seen_new_gids="$seen_new_gids"$'\n'"$gid"
+        fi
+
+        valid_rows=$((valid_rows + 1))
+    done < "$csv_file"
+
+    if [[ "$is_dry_run" == "true" ]]; then
+        echo -e "${YELLOW}Dry Run Complete. Found ${errors} errors, ${valid_rows} valid rows. See ${fail_log} for details.${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Validation complete. ${valid_rows} rows will be provisioned, ${errors} skipped.${NC}"
+    if ! prompt_confirm "Ready to provision users. Proceed with bulk import?"; then
+        echo "Aborted."
+        return 1
+    fi
+
+    echo -e "${GREEN}Executing skip-and-continue import...${NC}"
+    echo -e "${YELLOW}Warning: If your CSV contains plaintext passwords, ensure the source file is securely deleted after import!${NC}"
+
+    local runtime_errors=0
+    line_num=0
+    while IFS=',' read -r user pass uid gid groups shell; do
+        line_num=$((line_num + 1))
+        if [[ -z "$user" || "$user" == "user" || "$user" == "username" ]]; then continue; fi
+
+        # Sanitize Excel DOS line endings (\r) from the last column
+        shell="${shell//$'\r'/}"
+
+        # Base-10 numerical normalization for execution execution loop
+        if [[ "$uid" =~ ^[0-9]{1,10}$ ]]; then uid=$((10#$uid)); fi
+        if [[ "$gid" =~ ^[0-9]{1,10}$ ]]; then gid=$((10#$gid)); fi
+
+        if grep -q "Line ${line_num}:" "$fail_log" 2>/dev/null && ! grep -q "Advisory" <<<"$(grep "Line ${line_num}:" "$fail_log" 2>/dev/null)"; then
+            continue
+        fi
+
+        if ! getent group "$gid" >/dev/null 2>&1; then
+            groupadd -g "$gid" "${user}_grp" 2>/dev/null || true
+        fi
+
+        useradd -u "$uid" -g "$gid" -s "$shell" -m "$user" || {
+            echo "Line ${line_num}: Failed to execute useradd for ${user}." | tee -a "$fail_log"
+            runtime_errors=$((runtime_errors + 1))
+            continue
+        }
+
+        if [[ -n "$groups" && "$groups" != "none" ]]; then
+            usermod -aG "$groups" "$user" || {
+                echo "Line ${line_num}: Warning - failed to add ${user} to supplementary groups ${groups}." | tee -a "$fail_log"
+            }
+        fi
+
+        if [[ -z "$pass" || "$pass" == "auto" ]]; then
+            local pfile
+            pfile=$(generate_secure_password "$user" "false")
+            echo "Generated password for ${user} saved to ${pfile}"
+        else
+            echo "${user}:${pass}" | chpasswd || true
+            chage -d 0 "$user" || true
+        fi
+
+        log_action "BULK IMPORTED USER: ${user} (UID: ${uid})"
+    done < "$csv_file"
+
+    echo -e "${GREEN}Bulk Import Finished. Found ${errors} validation errors, ${runtime_errors} execution errors (logged to ${fail_log}).${NC}"
+    echo -e "${GREEN}Note: Bootstrap password files are in ${PASS_DIR}.${NC}"
+}
+
+# ==============================================================================
+# MAIN MENU / ARG PARSING
+# ==============================================================================
+interactive_menu() {
+    clear
+    cat << EOF
+==================================================
+        USER/GROUP MANAGER (UGM) v1.9
+==================================================
+Usage: ugm.sh [OPTIONS]
+Run 'ugm.sh --help' for full CLI usage.
+
+Data & Logs Locations:
+  Ledger DB:    ${LEDGER}
+  Passwords:    ${PASS_DIR}
+  Audit Log:    ${AUDIT_LOG}
+  Backups:      ${BACKUP_DIR}
+
+ --- USER MANAGEMENT ---
+ [1] Provision New User (Interactive)
+ [2] Safe Delete / Offboard User
+ [3] FORCE LOGOUT User (Panic Button)
+ [4] List Active Users
+ --- GROUP MANAGEMENT ---
+ [5] Create Group
+ [6] Delete Group (Interactive Migration)
+ [7] List Active Groups
+ --- REPORTING & AUDIT ---
+ [8] Check User Resource Usage (Snapshot)
+ --- BULK & MAINTENANCE ---
+ [9] Bulk Import from CSV
+ [10] Dry-Run Bulk Import from CSV
+ [11] Shred Temporary Passwords
+ [12] Exit
+==================================================
+EOF
+    read -r -p "Select option(s) (comma-separated, e.g., 1 or 4,7): " opt_str < /dev/tty
+
+    IFS=',' read -ra OPTS <<< "$opt_str"
+    for opt in "${OPTS[@]}"; do
+        opt=$(echo "$opt" | xargs) # trim whitespace
+        echo -e "\n${CYAN}--- Executing Option [$opt] ---${NC}"
+        case $opt in
+            1) cmd_create_user ;;
+            2) cmd_delete_user ;;
+            3) cmd_panic_kick ;;
+            4) cmd_list_users ;;
+            5) cmd_group_create ;;
+            6) cmd_group_delete ;;
+            7) cmd_list_groups ;;
+            8) cmd_resources ;;
+            9)
+                echo -e "${CYAN}=== CSV Format Requirements ===${NC}"
+                echo "Expected Columns : username,password,uid,gid,groups,shell"
+                echo " - password      : Use 'auto' to auto-generate securely."
+                echo " - uid/gid       : Numeric values (Protected IDs strictly blocked)."
+                echo " - groups        : Comma-separated (e.g., sudo,docker) or 'none'."
+                echo " - shell         : Must exist in /etc/shells (e.g., /bin/bash)."
+                echo "======================================="
+                read -r -p "Enter path to CSV file: " csv_file < /dev/tty
+                read -r -p "Allow system IDs (uid/gid < min)? [y/N]: " allow_sys_in < /dev/tty
+                local allow_sys="false"
+                if [[ "${allow_sys_in:-N}" =~ ^[Yy] ]]; then allow_sys="true"; fi
+                cmd_bulk_import "$csv_file" "false" "$allow_sys"
+                ;;
+            10)
+                echo -e "${CYAN}=== CSV Format Requirements ===${NC}"
+                echo "Expected Columns : username,password,uid,gid,groups,shell"
+                echo " - password      : Use 'auto' to auto-generate securely."
+                echo " - uid/gid       : Numeric values (Protected IDs strictly blocked)."
+                echo " - groups        : Comma-separated (e.g., sudo,docker) or 'none'."
+                echo " - shell         : Must exist in /etc/shells (e.g., /bin/bash)."
+                echo "======================================="
+                read -r -p "Enter path to CSV file: " csv_file < /dev/tty
+                read -r -p "Allow system IDs (uid/gid < min)? [y/N]: " allow_sys_in < /dev/tty
+                local allow_sys="false"
+                if [[ "${allow_sys_in:-N}" =~ ^[Yy] ]]; then allow_sys="true"; fi
+                cmd_bulk_import "$csv_file" "true" "$allow_sys"
+                ;;
+            11)
+                echo "Removing all temporary password files from ${PASS_DIR}..."
+                find "${PASS_DIR}" -type f -name "*_temp_pass.txt" -exec rm -f {} \;
+                echo "Done."
+                ;;
+            12) exit 0 ;;
+            *) echo -e "${RED}Invalid option: $opt${NC}" ;;
+        esac
+    done
+}
+
+if [[ $# -eq 0 ]]; then
+    interactive_menu
+    exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--create)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a username." >&2; exit 1; fi
+            cmd_create_user "$2"
+            shift 2
+            ;;
+        -d|--delete)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a username." >&2; exit 1; fi
+            cmd_delete_user "$2"
+            shift 2
+            ;;
+        -k|--kick)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a username." >&2; exit 1; fi
+            cmd_panic_kick "$2"
+            shift 2
+            ;;
+        -R|--resources)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a username." >&2; exit 1; fi
+            cmd_resources "$2"
+            shift 2
+            ;;
+        -lu|--list-users)
+            cmd_list_users
+            shift 1
+            ;;
+        -gc|--group-create)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a group name." >&2; exit 1; fi
+            cmd_group_create "$2"
+            shift 2
+            ;;
+        -gd|--group-delete)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a group name." >&2; exit 1; fi
+            target_group="$2"
+            migrate_to=""
+            shift 2
+            if [[ $# -gt 0 && ("$1" == "--migrate-to" || "$1" == "-m") ]]; then
+                if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a group name." >&2; exit 1; fi
+                migrate_to="$2"
+                shift 2
+            fi
+            cmd_group_delete "$target_group" "$migrate_to"
+            ;;
+        -lg|--list-groups)
+            cmd_list_groups
+            shift 1
+            ;;
+        -b|--bulk)
+            if [[ -z "${2:-}" ]]; then echo "Error: $1 requires a CSV file path." >&2; exit 1; fi
+            csv_file="$2"
+            shift 2
+            is_dry_run="false"
+            allow_sys="false"
+            while [[ $# -gt 0 ]]; do
+                if [[ "$1" == "--dry-run" || "$1" == "-n" ]]; then
+                    is_dry_run="true"
+                    shift 1
+                elif [[ "$1" == "--allow-system-ids" || "$1" == "-a" ]]; then
+                    allow_sys="true"
+                    shift 1
+                else
+                    break
+                fi
+            done
+            cmd_bulk_import "$csv_file" "$is_dry_run" "$allow_sys"
+            ;;
+        -n|--dry-run|-a|--allow-system-ids)
+            echo -e "${RED}Error: $1 must follow --bulk <file.csv>${NC}" >&2
+            exit 1
+            ;;
+        -s|--shred-passwords)
+            echo "Removing all temporary password files from ${PASS_DIR}..."
+            find "${PASS_DIR}" -type f -name "*_temp_pass.txt" -exec rm -f {} \;
+            echo "Done."
+            shift 1
+            ;;
+        -i|--install-completion)
+            mkdir -p /etc/bash_completion.d
+            cat << 'EOF' > /etc/bash_completion.d/ugm
+_ugm_completions() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="-c --create -d --delete -k --kick -R --resources -lu --list-users -gc --group-create -gd --group-delete -m --migrate-to -lg --list-groups -b --bulk -n --dry-run -a --allow-system-ids -s --shred-passwords -i --install-completion -h --help"
+
+    case "${prev}" in
+        -c|--create|-d|--delete|-k|--kick|-R|--resources)
+            COMPREPLY=( $(compgen -u -- ${cur}) )
+            return 0
+            ;;
+        -gc|--group-create|-gd|--group-delete|-m|--migrate-to)
+            COMPREPLY=( $(compgen -g -- ${cur}) )
+            return 0
+            ;;
+        -b|--bulk)
+            COMPREPLY=( $(compgen -f -- ${cur}) )
+            return 0
+            ;;
+    esac
+
+    if [[ ${cur} == -* ]] ; then
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+}
+complete -F _ugm_completions ugm.sh
+complete -F _ugm_completions ./ugm.sh
+EOF
+            chmod 644 /etc/bash_completion.d/ugm
+            echo -e "${GREEN}Bash completion installed to /etc/bash_completion.d/ugm${NC}"
+            echo -e "${YELLOW}Please run 'source /etc/bash_completion.d/ugm' or open a new shell to use it.${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown flag or malformed input '${1}'${NC}" >&2
+            echo "Run 'ugm.sh --help' for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+exit 0

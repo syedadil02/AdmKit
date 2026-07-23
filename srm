@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+#
+# srm — System Resource Monitor
+#
+# Purpose: A read-only diagnostic snapshot tool for Linux.
+# Requirements: Runs on RHEL/Fedora or Debian/Ubuntu derivatives.
+# Usage:
+#   srm [OPTIONS]
+# Options:
+#   (no flags)      Full default report, all sections
+#   --full          Full report with extended/verbose detail
+#   -m, --memory    Memory section only
+#   -c, --cpu       CPU section only
+#   -d, --disk      Disk/inode/filesystem sections only
+#   -n, --network   Network snapshot section only
+#   -w, --hardware  Hardware health section only (RAID/SMART/Sensors)
+#   -p, --peripherals  Attached hardware section only
+#   -h, --help      Usage and flag list
+
+set -u
+set -o pipefail
+
+# ==============================================================================
+# Configuration & Globals
+# ==============================================================================
+
+# Severity Color Codes (Use strictly for severity, not decoration)
+RED='\033[0;31m'    # Error / Critical / Pre-fail
+YELLOW='\033[0;33m' # Warning / Threshold breached
+NC='\033[0m'        # No Color / Default
+
+# State Flags
+FULL_REPORT=0
+RUN_SUMMARY=0
+RUN_MEM=0
+RUN_CPU=0
+RUN_DISK=0
+RUN_NET=0
+RUN_HW=0
+RUN_PERIPH=0
+RUN_LOGS=0
+
+# Detected Package Manager
+PKG_MGR=""
+
+# Dependency State Variables
+DEP_SMART=0
+DEP_SENSORS=0
+DEP_MDADM=0
+DEP_BTRFS=0
+DEP_ZFS=0
+
+# ==============================================================================
+# Helpers
+# ==============================================================================
+
+print_header() {
+    echo ""
+    echo "================================================================================"
+    echo " $1"
+    echo "================================================================================"
+}
+
+fail_usage() {
+    echo -e "${RED}Error: $1${NC}"
+    echo "Usage: srm [--full] [-m|--memory] [-c|--cpu] [-d|--disk] [-n|--network] [-w|--hardware] [-p|--peripherals] [-h|--help]"
+    exit 1
+}
+
+detect_distro() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MGR="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MGR="yum"
+    else
+        echo -e "${RED}Unsupported or unknown distro (no apt/dnf/yum found). Will attempt to run without package installation capability.${NC}"
+        PKG_MGR="none"
+    fi
+}
+
+check_and_install_dep() {
+    local cmd=$1
+    local pkg_apt=$2
+    local pkg_dnf=$3
+    local desc=$4
+
+    if command -v "$cmd" >/dev/null 2>&1; then
+        return 0 # Tool is present
+    fi
+
+    echo -e "${YELLOW}Missing dependency: $cmd ($desc)${NC}"
+
+    # Check if we have an interactive TTY for confirmation
+    if [ ! -t 0 ]; then
+        echo -e "${YELLOW}Not running interactively; skipping installation of $cmd.${NC}"
+        return 1
+    fi
+
+    read -p "Install $cmd now? [y/N] " -r ans </dev/tty
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            sudo apt-get update -qq && sudo apt-get install -y "$pkg_apt"
+        elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
+            sudo "$PKG_MGR" install -y "$pkg_dnf"
+        else
+            echo -e "${RED}Cannot install: No supported package manager.${NC}"
+            return 1
+        fi
+
+        # Verify it actually installed
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "Successfully installed $cmd."
+            return 0
+        else
+            echo -e "${RED}Installation of $cmd failed.${NC}"
+            return 1
+        fi
+    else
+        echo "Skipped installation."
+        return 1
+    fi
+}
+
+# ==============================================================================
+# Dependency Layer
+# ==============================================================================
+
+satisfy_dependencies() {
+    echo "Checking diagnostic dependencies..."
+
+    check_and_install_dep "smartctl" "smartmontools" "smartmontools" "Disk health/SMART queries" && DEP_SMART=1 || DEP_SMART=0
+    check_and_install_dep "sensors" "lm-sensors" "lm_sensors" "CPU and hardware temperature readings" && DEP_SENSORS=1 || DEP_SENSORS=0
+
+    # Only ask for mdadm if /proc/mdstat exists and indicates software RAID
+    if [[ -f /proc/mdstat ]] && grep -q '^md' /proc/mdstat; then
+        check_and_install_dep "mdadm" "mdadm" "mdadm" "Software RAID status reporting" && DEP_MDADM=1 || DEP_MDADM=0
+    fi
+
+    # Btrfs check (only if Btrfs mounts exist)
+    if grep -q 'btrfs' /proc/mounts; then
+        check_and_install_dep "btrfs" "btrfs-progs" "btrfs-progs" "Btrfs filesystem health queries" && DEP_BTRFS=1 || DEP_BTRFS=0
+    fi
+
+    # ZFS check (only if zfs module is loaded)
+    if lsmod | grep -q '^zfs '; then
+        check_and_install_dep "zpool" "zfsutils-linux" "zfs" "ZFS pool health queries" && DEP_ZFS=1 || DEP_ZFS=0
+    fi
+}
+
+# ==============================================================================
+# Section 1 - System Summary
+# ==============================================================================
+
+section_system_summary() {
+    print_header "SECTION 1: SYSTEM SUMMARY"
+
+    # Distro name
+    local distro="Unknown"
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        distro=$(source /etc/os-release && echo "$PRETTY_NAME")
+    fi
+    echo -e "OS Distribution : $distro"
+
+    # Kernel
+    echo -e "Kernel Version  : $(uname -r)"
+
+    # Uptime & Load
+    local up_str
+    up_str=$(uptime)
+    # Extract load averages safely (uptime output formats vary)
+    local load_avg
+    load_avg=$(echo "$up_str" | awk -F'load average:' '{print $2}' | sed 's/^ //')
+    # Extract uptime
+    local uptime_val
+    uptime_val=$(echo "$up_str" | awk -F',' '{print $1}' | sed 's/^ *//')
+
+    echo -e "Uptime          : $uptime_val"
+    echo -e "Load Average    : $load_avg"
+
+    # RAM
+    local mem_total mem_used
+    mem_total=$(free -h | awk '/^Mem:/ {print $2}')
+    mem_used=$(free -h | awk '/^Mem:/ {print $3}')
+    echo -e "RAM Usage       : $mem_used / $mem_total"
+}
+
+# ==============================================================================
+# Section 2 - Resource Consumers
+# ==============================================================================
+
+section_resource_consumers() {
+    print_header "SECTION 2: RESOURCE CONSUMERS"
+
+    echo "--- Top 5 CPU Consumers ---"
+    # %cpu %mem pid comm
+    ps -eo pcpu,pmem,pid,comm --sort=-pcpu | head -n 6 | tail -n 5 | while read -r cpu mem pid comm; do
+        if [[ "$cpu" != "0.0" ]]; then
+            echo "- $comm (PID $pid) is consuming $cpu% CPU"
+        fi
+    done
+
+    echo ""
+    echo "--- Top 5 Memory Consumers ---"
+    ps -eo pmem,pcpu,pid,comm --sort=-pmem | head -n 6 | tail -n 5 | while read -r mem cpu pid comm; do
+        if [[ "$mem" != "0.0" ]]; then
+            echo "- $comm (PID $pid) is consuming $mem% RAM"
+        fi
+    done
+
+    echo ""
+    echo "--- CPU Time Breakdown ---"
+    # Using vmstat to get aggregated CPU times dynamically finding columns
+    if command -v vmstat >/dev/null 2>&1; then
+        local vmstat_raw vmstat_head vmstat_data
+        vmstat_raw=$(vmstat 1 2)
+        vmstat_head=$(echo "$vmstat_raw" | sed -n '2p')
+        vmstat_data=$(echo "$vmstat_raw" | tail -1)
+
+        local col_us col_sy col_wa col_st
+        col_us=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="us") print i}')
+        col_sy=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="sy") print i}')
+        col_wa=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="wa") print i}')
+        col_st=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="st") print i}')
+
+        local us="0" sy="0" wa="0" st="0"
+        if [[ -n "$col_us" ]]; then us=$(echo "$vmstat_data" | awk -v col="$col_us" '{print $col}'); fi
+        if [[ -n "$col_sy" ]]; then sy=$(echo "$vmstat_data" | awk -v col="$col_sy" '{print $col}'); fi
+        if [[ -n "$col_wa" ]]; then wa=$(echo "$vmstat_data" | awk -v col="$col_wa" '{print $col}'); fi
+        if [[ -n "$col_st" ]]; then st=$(echo "$vmstat_data" | awk -v col="$col_st" '{print $col}'); fi
+
+        echo "User: ${us}% | System: ${sy}% | IOWait: ${wa}% | Steal: ${st}%"
+
+        if [[ "$st" =~ ^[0-9]+$ ]] && (( st > 0 )); then
+            echo -e "${YELLOW}Warning: Steal time is >0% (${st}%). If running in a VM, this indicates hypervisor resource contention.${NC}"
+        fi
+    else
+        echo "Unavailable: 'vmstat' not installed."
+    fi
+}
+
+# ==============================================================================
+# Section 3 - Root-cause Checks
+# ==============================================================================
+
+section_root_cause_checks() {
+    print_header "SECTION 3: ROOT CAUSE CHECKS (Loaded but Idle)"
+
+    # 1. D-state processes
+    echo "--- D-State (Uninterruptible Sleep) Processes ---"
+    local d_procs
+    d_procs=$(ps -eo pid,state,wchan,comm | awk '$2=="D"')
+    if [[ -n "$d_procs" ]]; then
+        echo -e "${YELLOW}Warning: D-state processes detected. This usually indicates stuck I/O, not CPU-bound load.${NC}"
+        echo "Note: WCHAN may display as '0' or '-' on modern kernels without wchan support enabled."
+        echo "$d_procs" | while read -r pid state wchan comm; do
+            echo -e "${YELLOW}  - $comm (PID $pid) waiting on $wchan${NC}"
+        done
+    else
+        echo "None detected (Healthy)."
+    fi
+
+    # 2. Zombies
+    echo ""
+    echo "--- Zombie Processes ---"
+    local zombies
+    zombies=$(ps -eo state | grep -c "Z" || true)
+    if (( zombies > 0 )); then
+        echo -e "${YELLOW}Warning: $zombies zombie/defunct processes found.${NC}"
+    else
+        echo "None detected (Healthy)."
+    fi
+
+    # 3. Duplicate PIDs (Cron/Systemd stacking)
+    echo ""
+    echo "--- Stacking Job Detection ---"
+    local duplicates
+    duplicates=$(ps -eo comm | sort | uniq -c | awk '$1 > 5 {print $0}')
+    if [[ -n "$duplicates" ]]; then
+        echo "Processes with more than 5 running instances (Possible hung scheduled jobs):"
+        echo "$duplicates" | while read -r count comm; do
+            # Filter out expected duplicates and kernel threads
+            if [[ "$comm" != "nginx" && "$comm" != "php-fpm"* && "$comm" != "apache2" && "$comm" != "httpd" && "$comm" != "sshd" && ! "$comm" =~ ^(kworker|ksoftirqd|migration|rcu) ]]; then
+                echo -e "${YELLOW}  - $comm ($count instances)${NC}"
+            fi
+        done
+    else
+        echo "No obvious job stacking detected."
+    fi
+
+    # 4. Interrupt storm detection
+    echo ""
+    echo "--- Interrupt Storm Detection ---"
+    local int1 int2 delta
+    int1=$(mktemp)
+    int2=$(mktemp)
+
+    # Simple sampling
+    cat /proc/interrupts > "$int1" 2>/dev/null || true
+    sleep 2
+    cat /proc/interrupts > "$int2" 2>/dev/null || true
+
+    # Process the files to find massive deltas
+    awk '
+        NR==FNR { for(i=2; i<=NF; i++) if($i ~ /^[0-9]+$/) old[$1]+=$i; next }
+        {
+            cur=0;
+            for(i=2; i<=NF; i++) if($i ~ /^[0-9]+$/) cur+=$i;
+            if ($1 in old) {
+                delta = cur - old[$1];
+                if (delta > 20000) {
+                    print $1 " " delta " " $NF
+                }
+            }
+        }
+    ' "$int1" "$int2" > "${int1}.res"
+
+    if [[ -s "${int1}.res" ]]; then
+        echo -e "${YELLOW}Warning: Unusually high interrupt rate detected (Storm possible):${NC}"
+        while read -r irq delta dev; do
+            echo -e "${YELLOW}  - IRQ $irq ($dev): +$delta interrupts in 2s${NC}"
+        done < "${int1}.res"
+    else
+        echo "Interrupt rates normal."
+    fi
+    rm -f "$int1" "$int2" "${int1}.res"
+
+    # 5. CPU Thermal Throttling / Clock speed
+    echo ""
+    echo "--- CPU Clock & Thermal Throttling ---"
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq && -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
+        local cur_freq max_freq pct
+        cur_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "0")
+        max_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo "0")
+
+        if (( max_freq > 0 )); then
+            pct=$(( cur_freq * 100 / max_freq ))
+            echo "CPU0 Current: $(( cur_freq / 1000 )) MHz / Max: $(( max_freq / 1000 )) MHz ($pct%)"
+            if (( pct < 40 )); then
+                echo -e "${YELLOW}Warning: CPU is running notably below max clock. Check Section 5 for thermal throttling.${NC}"
+            fi
+        else
+            echo "CPU frequency max unknown."
+        fi
+    else
+        echo "CPU frequency scaling metrics not exposed on this system."
+    fi
+
+    # 6. IOWait / Steal Synthesis
+    echo ""
+    echo "--- Load Synthesis ---"
+    if command -v vmstat >/dev/null 2>&1; then
+        local vmstat_raw vmstat_head vmstat_data
+        vmstat_raw=$(vmstat 1 2)
+        vmstat_head=$(echo "$vmstat_raw" | sed -n '2p')
+        vmstat_data=$(echo "$vmstat_raw" | tail -1)
+
+        local col_wa col_st wa st
+        col_wa=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="wa") print i}')
+        col_st=$(echo "$vmstat_head" | awk '{for(i=1;i<=NF;i++) if($i=="st") print i}')
+
+        wa="0"; st="0"
+        if [[ -n "$col_wa" ]]; then wa=$(echo "$vmstat_data" | awk -v col="$col_wa" '{print $col}'); fi
+        if [[ -n "$col_st" ]]; then st=$(echo "$vmstat_data" | awk -v col="$col_st" '{print $col}'); fi
+
+        if [[ "$wa" =~ ^[0-9]+$ ]] && (( wa > 15 )); then
+            echo -e "${YELLOW}Analysis: High IOWait (${wa}%) confirms the system is bottlenecked by disk access, not raw CPU computation.${NC}"
+        elif [[ "$st" =~ ^[0-9]+$ ]] && (( st > 10 )); then
+            echo -e "${YELLOW}Analysis: High Steal (${st}%) confirms the system is being starved of CPU by the underlying hypervisor.${NC}"
+        else
+            echo "IOWait and Steal times appear within normal operational bounds."
+        fi
+    fi
+}
+
+# ==============================================================================
+# Section 4 - Disk & Space
+# ==============================================================================
+
+section_disk_space() {
+    print_header "SECTION 4: DISK / SPACE"
+
+    echo "--- Mount Space Usage ---"
+    df -h -x tmpfs -x devtmpfs -x squashfs -x loop -x overlay | while read -r line; do
+        local pct
+        pct=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then
+            echo -e "${YELLOW}$line (WARNING: >= 90% full)${NC}"
+        else
+            echo "$line"
+        fi
+    done
+
+    echo ""
+    echo "--- Mount Inode Usage ---"
+    df -i -x tmpfs -x devtmpfs -x squashfs -x loop -x overlay | while read -r line; do
+        local pct
+        pct=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 85 )); then
+            echo -e "${YELLOW}$line (WARNING: >= 85% inode usage)${NC}"
+            if (( pct >= 85 )); then
+                echo -e "${YELLOW}  ^ Note: Inode exhaustion means you cannot create new files here even if 'df -h' shows free space.${NC}"
+            fi
+        else
+            echo "$line"
+        fi
+    done
+
+    if [[ "$FULL_REPORT" == 1 ]]; then
+        echo ""
+        echo "--- Largest Space Consumers (Top 10 directories under /var) ---"
+        echo "(Note: Scanning /var only to bound execution time; disk pressure on /home or /opt will not be shown)"
+        if [[ -d /var ]]; then
+            # du -S prevents parent directories from absorbing child sizes, providing distinct consumers
+            sudo du -Sh -x /var 2>/dev/null | sort -rh | head -n 10 | while read -r size path; do
+                echo "- $size : $path"
+            done
+        fi
+
+        echo ""
+        echo "--- Largest Files (Top 10 under /var) ---"
+        if [[ -d /var ]]; then
+            sudo find /var -xdev -type f -exec du -Sh {} + 2>/dev/null | sort -rh | head -n 10 | while read -r size path; do
+                echo "- $size : $path"
+            done
+        fi
+
+        echo ""
+        echo "--- Highest Inode Count Directories (Top 10 under /var) ---"
+        echo "(Note: Counts files per immediate parent as an approximation; directories filled with subdirectories rather than files will not be surfaced)"
+        if [[ -d /var ]]; then
+            # Fast, subshell-free inode count approximation by finding files and counting their parent directories
+            sudo find /var -xdev -type f -printf "%h\n" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10 | while read -r count path; do
+                echo "- $count files in $path"
+            done
+        fi
+    fi
+}
+
+# ==============================================================================
+# Section 5 - Hardware Health
+# ==============================================================================
+
+section_hardware_health() {
+    print_header "SECTION 5: HARDWARE HEALTH"
+
+    # Hardware RAID out of scope note
+    # Note: Hardware RAID via megacli/vendor tools is out of scope for v1 due to vendor-specific tooling variance.
+
+    echo "--- Software RAID (mdadm) ---"
+    if [[ $DEP_MDADM == 1 && -f /proc/mdstat ]]; then
+        local md_arrays
+        md_arrays=$(grep '^md' /proc/mdstat | awk '{print $1}')
+        if [[ -z "$md_arrays" ]]; then
+            echo "No active software RAID arrays found."
+        else
+            for md in $md_arrays; do
+                local md_state
+                md_state=$(sudo mdadm --detail "/dev/$md" | grep 'State :')
+                if echo "$md_state" | grep -qi -E 'degraded|failed|recovering'; then
+                    echo -e "${RED}/dev/$md : $md_state${NC}"
+                else
+                    echo "/dev/$md : $md_state"
+                fi
+            done
+        fi
+    else
+        echo "Skipped — mdadm not installed or no software RAID detected."
+    fi
+
+    echo ""
+    echo "--- Physical Disk Health (SMART) ---"
+    if [[ $DEP_SMART == 1 ]]; then
+        local disks
+        disks=$(lsblk -nd -o NAME,TYPE | awk '$2=="disk" {print $1}')
+        for d in $disks; do
+            local health
+            health=$(sudo smartctl -H "/dev/$d" 2>/dev/null | grep 'test result' || true)
+            if [[ -z "$health" ]]; then
+                echo "/dev/$d: SMART health status unavailable"
+            elif echo "$health" | grep -qi 'PASSED'; then
+                echo "/dev/$d: $health"
+            else
+                echo -e "${RED}/dev/$d: $health (PRE-FAIL / WARNING)${NC}"
+            fi
+        done
+    else
+        echo "Skipped — smartmontools not installed."
+    fi
+
+    echo ""
+    echo "--- Thermal Sensors ---"
+    if [[ $DEP_SENSORS == 1 ]]; then
+        local sens_out
+        sens_out=$(sensors 2>/dev/null)
+        if [[ -z "$sens_out" ]]; then
+            echo "No sensors detected (may need 'sensors-detect' run)."
+        else
+            echo "$sens_out" | grep -E 'Core|Package|temp|crit' | while read -r line; do
+                if echo "$line" | grep -q 'ALARM\|CRIT'; then
+                    echo -e "${RED}$line${NC}"
+                elif [[ $(echo "$line" | awk '{print $2}' | tr -d '+°C' | awk '{ if ($1+0 > 85) print "HOT" }') == "HOT" ]]; then
+                    echo -e "${YELLOW}$line (Warning: High Temp)${NC}"
+                else
+                    echo "$line"
+                fi
+            done
+        fi
+    else
+        echo "Skipped — lm-sensors not installed."
+    fi
+}
+
+# ==============================================================================
+# Section 6 - Filesystem Health
+# ==============================================================================
+
+section_fs_health() {
+    print_header "SECTION 6: FILESYSTEM HEALTH"
+
+    # Gather local block mounts
+    local mounts
+    mounts=$(df -T -x tmpfs -x devtmpfs -x squashfs -x loop -x overlay | tail -n +2)
+
+    if [[ -z "$mounts" ]]; then
+        echo "No standard block filesystems detected."
+        return
+    fi
+
+    echo "$mounts" | while read -r fs type blocks used avail pct mnt; do
+        echo "--- Mount: $mnt ($type) ---"
+        case "$type" in
+            ext4)
+                if command -v tune2fs >/dev/null 2>&1; then
+                    local t2_out
+                    t2_out=$(sudo tune2fs -l "$fs" 2>/dev/null)
+                    local state mnt_count max_count last_check
+                    state=$(echo "$t2_out" | grep 'Filesystem state:' | awk -F': ' '{print $2}' | tr -d ' ' || echo "Unknown")
+                    mnt_count=$(echo "$t2_out" | grep 'Mount count:' | awk '{print $NF}' || echo "0")
+                    max_count=$(echo "$t2_out" | grep 'Maximum mount count:' | awk '{print $NF}' || echo "-1")
+                    last_check=$(echo "$t2_out" | grep 'Last checked:' | cut -d':' -f2- | sed 's/^ *//' || echo "Unknown")
+
+                    if [[ "$state" == *"error"* || "$state" != *"clean"* ]]; then
+                        echo -e "State: ${RED}$state${NC}"
+                    else
+                        echo "State: $state"
+                    fi
+
+                    if [[ "$max_count" != "-1" && "$mnt_count" =~ ^[0-9]+$ && "$max_count" =~ ^[0-9]+$ ]] && (( mnt_count >= max_count )); then
+                        echo -e "Mount Count: ${YELLOW}$mnt_count / $max_count (fsck overdue)${NC}"
+                    else
+                        echo "Mount Count: $mnt_count / $max_count"
+                    fi
+                    echo "Last Checked: $last_check"
+                else
+                    echo "Unavailable: 'tune2fs' not found."
+                fi
+                ;;
+            xfs)
+                if command -v xfs_info >/dev/null 2>&1; then
+                    local d_sect
+                    d_sect=$(sudo xfs_info "$mnt" 2>/dev/null | grep 'data *=' | head -n1)
+                    echo "XFS Geometry: $d_sect"
+                    echo "Note: XFS relies on runtime kernel error reporting. See Section 7 for any XFS journal alerts."
+                else
+                    echo "Unavailable: 'xfsprogs' not found."
+                fi
+                ;;
+            btrfs)
+                if [[ $DEP_BTRFS == 1 ]]; then
+                    echo "Device Stats (Errors):"
+                    sudo btrfs device stats "$mnt" 2>/dev/null | while read -r line; do
+                        local err_val
+                        err_val=$(echo "$line" | awk '{print $NF}')
+                        if (( err_val > 0 )); then
+                            echo -e "${RED}  $line${NC}"
+                        else
+                            echo "  $line"
+                        fi
+                    done
+                    local scrub_stat
+                    scrub_stat=$(sudo btrfs scrub status "$mnt" 2>/dev/null | grep 'Status:' || echo "Status: Unknown/Never run")
+                    echo "Scrub $scrub_stat"
+                else
+                    echo "Skipped — btrfs-progs not installed."
+                fi
+                ;;
+            zfs)
+                # ZFS handles health at the pool level, handled separately below if ZFS is active.
+                echo "ZFS mount handled in pool status below."
+                ;;
+            *)
+                echo "No specialized health check implemented for $type."
+                ;;
+        esac
+        echo ""
+    done
+
+    # ZFS Pool Status Check (Applies to all ZFS mounts)
+    if [[ $DEP_ZFS == 1 ]]; then
+        echo "--- ZFS Pool Status ---"
+        local zpools
+        zpools=$(sudo zpool list -H -o name 2>/dev/null || true)
+        if [[ -n "$zpools" ]]; then
+            for zp in $zpools; do
+                local z_health
+                z_health=$(sudo zpool list -H -o health "$zp")
+                if [[ "$z_health" != "ONLINE" ]]; then
+                    echo -e "Pool $zp Health: ${RED}$z_health${NC}"
+                else
+                    echo "Pool $zp Health: $z_health"
+                fi
+
+                # Check for vdev errors (read/write/cksum)
+                local vdev_errs
+                vdev_errs=$(sudo zpool status "$zp" | awk '/ONLINE|DEGRADED|FAULTED/ && $1 !~ /pool|state|scan|config/ { if($3>0 || $4>0 || $5>0) print $0 }')
+                if [[ -n "$vdev_errs" ]]; then
+                    echo -e "${RED}VDEV Errors detected in pool $zp:${NC}"
+                    echo -e "${RED}$vdev_errs${NC}"
+                fi
+
+                # Capacity and Dedup
+                sudo zpool list -H -o name,capacity,dedupratio,compressratio "$zp" | while read -r name cap dedup comp; do
+                    echo "Pool $name Capacity: $cap, Dedup: $dedup, Compress: $comp"
+                done
+            done
+        else
+            echo "No ZFS pools found."
+        fi
+    fi
+}
+
+# ==============================================================================
+# Section 7 - Error Log Scan
+# ==============================================================================
+
+section_error_logs() {
+    print_header "SECTION 7: SYSTEM ERROR LOG SCAN (Since Boot)"
+
+    # Prefer journalctl
+    if command -v journalctl >/dev/null 2>&1; then
+        echo "Querying systemd journal for 'err' (priority 3) to 'emerg' (priority 0)..."
+        local j_errs
+        # Limit to 50 lines to prevent flooding the report
+        j_errs=$(sudo journalctl -b -k -p 0..3 --no-pager | tail -n 50)
+
+        if [[ -z "$j_errs" || "$j_errs" == "-- No entries --" ]]; then
+            echo "No critical kernel errors logged since boot."
+        else
+            echo "$j_errs" | while read -r line; do
+                # Highlight XFS/EXT4/I/O errors explicitly as cross-references
+                if echo "$line" | grep -qi -E 'xfs|ext4|btrfs|i/o error|scsi|ata'; then
+                    echo -e "${RED}$line (-> Cross-ref: Check Section 5/6!)${NC}"
+                else
+                    echo -e "${RED}$line${NC}"
+                fi
+            done
+        fi
+    else
+        echo "Querying dmesg for errors..."
+        local d_errs
+        d_errs=$(sudo dmesg -T -l err,crit,alert,emerg 2>/dev/null | tail -n 50 || true)
+        if [[ -z "$d_errs" ]]; then
+            echo "No critical kernel errors logged."
+        else
+            echo "$d_errs" | while read -r line; do
+                if echo "$line" | grep -qi -E 'xfs|ext4|btrfs|i/o error|scsi|ata'; then
+                    echo -e "${RED}$line (-> Cross-ref: Check Section 5/6!)${NC}"
+                else
+                    echo -e "${RED}$line${NC}"
+                fi
+            done
+        fi
+    fi
+}
+
+# ==============================================================================
+# Section 8 - Network Snapshot
+# ==============================================================================
+
+section_network_snapshot() {
+    print_header "SECTION 8: NETWORK SNAPSHOT"
+
+    echo "--- Listening Ports (ss -tuln) ---"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | head -n 20
+        local ss_count
+        ss_count=$(ss -tuln | wc -l)
+        if (( ss_count > 20 )); then
+            echo "... (Truncated. Total listening sockets: $ss_count)"
+        fi
+    else
+        echo "Unavailable: 'ss' command not found."
+    fi
+
+    echo ""
+    echo "--- Established Connections Summary ---"
+    if command -v ss >/dev/null 2>&1; then
+        local est_count
+        est_count=$(ss -tun state established | tail -n +2 | wc -l)
+        echo "Total Established TCP/UDP Connections: $est_count"
+    else
+        echo "Unavailable."
+    fi
+}
+
+# ==============================================================================
+# Section 9 - Attached Hardware
+# ==============================================================================
+
+section_attached_hardware() {
+    print_header "SECTION 9: ATTACHED HARDWARE"
+
+    echo "--- Relevant PCI Devices (Network/GPU/Storage) ---"
+    if command -v lspci >/dev/null 2>&1; then
+        lspci | grep -i -E 'VGA|3D|Ethernet|Network|RAID|SATA|NVMe' | while read -r line; do
+            echo "- $line"
+        done
+    else
+        echo "Unavailable: 'lspci' not found."
+    fi
+
+    echo ""
+    echo "--- USB Devices ---"
+    if command -v lsusb >/dev/null 2>&1; then
+        lsusb | while read -r line; do
+            echo "- $line"
+        done
+    else
+        echo "Unavailable: 'lsusb' not found."
+    fi
+
+    echo ""
+    echo "--- NIC Link Status ---"
+    if command -v ip >/dev/null 2>&1; then
+        local ifaces
+        ifaces=$(ip -o link show | awk -F': ' '{print $2}')
+        for iface in $ifaces; do
+            if [[ "$iface" == "lo" ]]; then continue; fi
+
+            local operstate
+            operstate=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo "unknown")
+            local speed
+            speed=$(cat "/sys/class/net/$iface/speed" 2>/dev/null || echo "unknown")
+
+            if [[ "$operstate" == "up" ]]; then
+                echo -e "Interface $iface : UP (Speed: ${speed}Mbps)"
+            else
+                echo -e "Interface $iface : ${YELLOW}DOWN${NC}"
+            fi
+        done
+    else
+        echo "Unavailable: 'ip' command not found."
+    fi
+}
+
+# ==============================================================================
+# Main Execution
+# ==============================================================================
+
+# Argument Parsing
+if [[ $# -eq 0 ]]; then
+    FULL_REPORT=0
+    RUN_SUMMARY=1; RUN_MEM=1; RUN_CPU=1; RUN_DISK=1; RUN_NET=1; RUN_HW=1; RUN_PERIPH=1; RUN_LOGS=1
+else
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --full) FULL_REPORT=1; RUN_SUMMARY=1; RUN_MEM=1; RUN_CPU=1; RUN_DISK=1; RUN_NET=1; RUN_HW=1; RUN_PERIPH=1; RUN_LOGS=1 ;;
+            -m|--memory) RUN_MEM=1; RUN_SUMMARY=1 ;;
+            -c|--cpu) RUN_CPU=1; RUN_SUMMARY=1 ;;
+            -d|--disk) RUN_DISK=1; RUN_LOGS=1 ;;
+            -n|--network) RUN_NET=1 ;;
+            -w|--hardware) RUN_HW=1; RUN_LOGS=1 ;;
+            -p|--peripherals) RUN_PERIPH=1 ;;
+            -h|--help)
+                echo "srm — System Resource Monitor"
+                echo "Usage: srm [--full] [-m|--memory] [-c|--cpu] [-d|--disk] [-n|--network] [-w|--hardware] [-p|--peripherals] [-h|--help]"
+                exit 0
+                ;;
+            *)
+                fail_usage "Unknown flag '$1'"
+                ;;
+        esac
+        shift
+    done
+fi
+
+# Request sudo credentials up front once to prevent stalling mid-report
+if [[ $RUN_DISK == 1 || $RUN_HW == 1 || $RUN_LOGS == 1 || $FULL_REPORT == 1 ]]; then
+    sudo -v || { echo -e "${RED}Warning: Failed to acquire sudo credentials. Some sections will fail or be skipped.${NC}"; }
+fi
+
+# Run logic
+detect_distro
+satisfy_dependencies
+
+if [[ $RUN_SUMMARY == 1 ]]; then
+    section_system_summary
+fi
+
+if [[ $RUN_CPU == 1 || $RUN_MEM == 1 ]]; then
+    section_resource_consumers
+    section_root_cause_checks
+fi
+
+if [[ $RUN_DISK == 1 ]]; then
+    section_disk_space
+fi
+
+if [[ $RUN_HW == 1 ]]; then
+    section_hardware_health
+fi
+
+if [[ $RUN_DISK == 1 ]]; then
+    section_fs_health
+fi
+
+if [[ $RUN_LOGS == 1 ]]; then
+    section_error_logs
+fi
+
+if [[ $RUN_NET == 1 ]]; then
+    section_network_snapshot
+fi
+
+if [[ $RUN_PERIPH == 1 ]]; then
+    section_attached_hardware
+fi
+
+echo ""
+echo "================================================================================"
+echo " Report Complete."
+echo "================================================================================"
+exit 0
