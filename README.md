@@ -69,16 +69,16 @@ Verifying downloaded ISOs and binaries manually is a tedious chore. You have to 
 
 ### Why use this over manual GPG commands?
 
-**1. No more remembering flags**
+**1. No more remembering flags:**
 Whether a vendor distributes checksums as `.sha256` sidecar files, `SHA256SUMS` manifests, or detached `.sig` files, `vein` auto-detects the format. You don't need to specify any flags — just pass the files to the script and it routes them to the correct validation tool automatically.
 
-**2. Strict trust check**
+**2. Strict trust check:**
 If you manually run `gpg --verify` on a file signed by an attacker's key, GPG will just say "Good Signature," because the math is valid. `vein` intercepts this: after validating the signature, it extracts the signer's fingerprint and cross-references it against a local `known_fingerprints.conf` file. If the fingerprint isn't on your approved list, the script throws a warning and halts.
 
-**3. Keeping your keyring clean**
+**3. Keeping your keyring clean:**
 Running `gpg --recv-keys` permanently saves untrusted, unverified keys from public keyservers into your personal `~/.gnupg` keyring. To prevent host pollution, `vein` performs all downloads and verifications inside a temporary, ephemeral keyring (`mktemp -d`). Once verification is complete, the temporary keyring is destroyed.
 
-**4. Automation ready**
+**4. Automation ready:**
 Instead of just printing a generic pass/fail, it translates errors into 11 specific exit codes. This makes it easy to drop into a bash provisioning script to automatically halt a deployment if a downloaded binary is corrupted or tampered with.
 
 ### Interface & Usage
