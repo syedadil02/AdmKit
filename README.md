@@ -70,7 +70,7 @@ Verifying downloaded ISOs and binaries manually is a tedious chore. You have to 
 ### Why use this over manual GPG commands?
 
 **1. No more remembering flags:**
-Whether a vendor distributes checksums as `.sha256` sidecar files, `SHA256SUMS` manifests, or detached `.sig` files, `vein` auto-detects the format. You don't need to specify any flags — just pass the files to the script and it routes them to the correct validation tool automatically.
+Whether a vendor distributes checksums as `.sha256` sidecar files, `SHA256SUMS` manifests, or detached `.sig` files, `vein` auto-detects the format. Just pass the files to the script and it routes them to the correct validation tool automatically.
 
 **2. Strict trust check:**
 If you manually run `gpg --verify` on a file signed by an attacker's key, GPG will just say "Good Signature," because the math is valid. `vein` intercepts this: after validating the signature, it extracts the signer's fingerprint and cross-references it against a local `known_fingerprints.conf` file. If the fingerprint isn't on your approved list, the script throws a warning and halts.
